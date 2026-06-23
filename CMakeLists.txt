@@ -1,5 +1,8 @@
 cmake_minimum_required(VERSION 3.16)
-project(call_service LANGUAGES C CXX)
+# ASM is needed to assemble openh264's aarch64 NEON .S files on arm64. openh264
+# also ships x86 SIMD, but as NASM/YASM .asm (needs a separate assembler) which
+# this build doesn't wire up, so x86_64 falls back to the portable C++ paths.
+project(call_service LANGUAGES C CXX ASM)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -11,8 +14,16 @@ set(VENDOR_DIR "${CMAKE_SOURCE_DIR}/vendor")
 set(TGCALLS_DEPS_DIR "${VENDOR_DIR}")
 set(STUB_DIR "${CMAKE_SOURCE_DIR}/stub")
 
-# Hack: BuildWebRTC.cmake uses ANDROID_ABI for platform-conditional sources
-set(ANDROID_ABI "x86_64")
+# Hack: the vendored Build*.cmake files use ANDROID_ABI to select
+# platform-conditional sources, SIMD flags, and defines. Map the real target
+# arch onto the ABI names they understand.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+  set(ANDROID_ABI "arm64-v8a")
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|AMD64")
+  set(ANDROID_ABI "x86_64")
+else()
+  message(FATAL_ERROR "Unsupported architecture: ${CMAKE_SYSTEM_PROCESSOR}")
+endif()
 
 # -- System library targets (must exist before Build*.cmake includes) --
 
@@ -88,14 +99,29 @@ list(REMOVE_ITEM _webrtc_sources
   "${WEBRTC_DIR}/modules/audio_device/audio_device_impl.cc"
 )
 list(APPEND _webrtc_sources
-  "${TGCALLS_DEPS_DIR}/crc32c/src/crc32c_sse42.cc"
   "${STUB_DIR}/audio_device_stub.cc"
 )
+
+# Hardware-accelerated crc32c, per arch. The stub crc32c_config.h sets
+# HAVE_SSE42 on x86_64 and HAVE_ARM64_CRC32C on aarch64, so the matching impl
+# must be compiled in or the dispatcher hits an undefined reference.
+if(ANDROID_ABI STREQUAL "x86_64")
+  list(APPEND _webrtc_sources "${TGCALLS_DEPS_DIR}/crc32c/src/crc32c_sse42.cc")
+elseif(ANDROID_ABI STREQUAL "arm64-v8a")
+  list(APPEND _webrtc_sources "${TGCALLS_DEPS_DIR}/crc32c/src/crc32c_arm64.cc")
+endif()
+
 set_target_properties(webrtc PROPERTIES SOURCES "${_webrtc_sources}")
 
-# crc32c_sse42.cc needs SSE4.2
-set_source_files_properties("${TGCALLS_DEPS_DIR}/crc32c/src/crc32c_sse42.cc"
-  PROPERTIES COMPILE_FLAGS "-msse4.2")
+# crc32c_sse42.cc needs SSE4.2; crc32c_arm64.cc needs the ARMv8 CRC (__crc32cd)
+# and PMULL (vmull_p64) extensions.
+if(ANDROID_ABI STREQUAL "x86_64")
+  set_source_files_properties("${TGCALLS_DEPS_DIR}/crc32c/src/crc32c_sse42.cc"
+    PROPERTIES COMPILE_FLAGS "-msse4.2")
+elseif(ANDROID_ABI STREQUAL "arm64-v8a")
+  set_source_files_properties("${TGCALLS_DEPS_DIR}/crc32c/src/crc32c_arm64.cc"
+    PROPERTIES COMPILE_FLAGS "-march=armv8-a+crc+crypto")
+endif()
 
 # Add pthread (Linux needs it explicitly)
 target_link_libraries(webrtc PUBLIC pthread)
@@ -113,8 +139,11 @@ target_compile_options(webrtc PRIVATE -Wno-error -Wno-deprecated-declarations
   "SHELL:-include stdint.h" "SHELL:-include stddef.h")
 target_compile_options(absl PRIVATE -Wno-error
   "SHELL:-include stdint.h" "SHELL:-include stddef.h")
+# Force-includes are for the C/C++ sources only — openh264's arm64 .S assembly
+# sources must not get them (the assembler can't parse stdint.h's typedefs).
 target_compile_options(openh264 PRIVATE
-  "SHELL:-include stdint.h" "SHELL:-include stddef.h")
+  "$<$<COMPILE_LANGUAGE:C,CXX>:SHELL:-include stdint.h>"
+  "$<$<COMPILE_LANGUAGE:C,CXX>:SHELL:-include stddef.h>")
 target_compile_options(usrsctp PRIVATE
   "SHELL:-include stdint.h" "SHELL:-include stddef.h")
 target_compile_options(srtp PRIVATE
@@ -231,7 +260,14 @@ target_include_directories(call_service PRIVATE
 target_compile_definitions(call_service PRIVATE
   WEBRTC_POSIX
   WEBRTC_LINUX
-  HAVE_SSE2
   NDEBUG
   OPENSSL_SUPPRESS_DEPRECATED
 )
+
+# Arch-specific WebRTC defines, mirroring what BuildWebRTC.cmake sets on the
+# webrtc target so inline header code compiles the same way in this TU.
+if(ANDROID_ABI STREQUAL "x86_64")
+  target_compile_definitions(call_service PRIVATE HAVE_SSE2)
+elseif(ANDROID_ABI STREQUAL "arm64-v8a")
+  target_compile_definitions(call_service PRIVATE WEBRTC_ARCH_ARM64 WEBRTC_HAS_NEON)
+endif()
